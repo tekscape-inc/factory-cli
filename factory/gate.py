@@ -15,6 +15,7 @@ import os
 import pathlib
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -172,10 +173,17 @@ def scope_check(repo, base: str, head: str, card: dict, manifest: dict) -> Scope
 
 
 def secrets_check(repo, base: str, head: str) -> GateResult:
-    """gitleaks on exactly the commits in base..head (8.30: `gitleaks git`; `detect` is deprecated)."""
+    """gitleaks on exactly the commits in base..head (8.30: `gitleaks git`; `detect` is deprecated).
+    Worker-controlled suppression is ignored: inline `gitleaks:allow` is disabled, and the repo's own
+    .gitleaks.toml / .gitleaksignore are bypassed by pointing config/ignore at empty trusted paths."""
+    empty = pathlib.Path(tempfile.mkdtemp(prefix="factory-gl-"))
+    (empty / "gitleaks.toml").write_text('[extend]\nuseDefault = true\n')
     argv = ["gitleaks", "git", "--log-opts", f"{base}..{head}", "--no-banner", "--redact",
-            "--exit-code", "1", str(repo)]
-    p = subprocess.run(argv, capture_output=True, text=True, check=False)
+            "--ignore-gitleaks-allow", "--config", str(empty / "gitleaks.toml"),
+            "--gitleaks-ignore-path", str(empty), "--exit-code", "1", str(repo)]
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GITLEAKS_")}
+    p = subprocess.run(argv, capture_output=True, text=True, check=False, env=env)
+    shutil.rmtree(empty, ignore_errors=True)
     return GateResult("secrets", "pass" if p.returncode == 0 else "fail",
                       command=" ".join(argv[:-1]), exit_code=p.returncode)
 
@@ -325,10 +333,12 @@ def post_ci_statuses(ev: Evidence, repo) -> None:
 
 
 def _judge_required(ev: Evidence, repo) -> bool:
-    """True iff the base branch's active rules require the factory/judge status."""
+    """True iff the base branch's active rules require factory/judge PINNED to the judge App (integration_id
+    from ~/.factory/app.json). An unpinned requirement could be satisfied by any token, so it does not count."""
     path = f"repos/{ev.doc['repo']['github']}/rules/branches/{ev.base_branch}"
     rules = json.loads(_call(["gh", "api", path], cwd=repo) or "[]")
-    return any(c.get("context") == "factory/judge" for r in rules
+    app = json.loads((pathlib.Path(os.environ.get("FACTORY_HOME", pathlib.Path.home() / ".factory")) / "app.json").read_text())
+    return any(c.get("context") == "factory/judge" and c.get("integration_id") == app["app_id"] for r in rules
                if r.get("type") == "required_status_checks"
                for c in r.get("parameters", {}).get("required_status_checks", []))
 
@@ -376,7 +386,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--push", action="store_true", help="on pass: push, PR, evidence comment, --auto")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
-    ev = run_gate(a.repo, a.card, a.c0, a.attempt, ci=a.ci, runs_root=a.runs_root)
+    try:
+        ev = run_gate(a.repo, a.card, a.c0, a.attempt, ci=a.ci, runs_root=a.runs_root)
+    except subprocess.CalledProcessError as e:  # e.g. no .factory/cards/<id>.json at C0 (bootstrap PRs)
+        print(f"factory gate: cannot gate card {a.card!r} at {a.c0[:12]}: {' '.join(e.cmd[:4])} failed "
+              f"(rc={e.returncode}) — not a factory card branch?", file=sys.stderr)
+        return 2
     print(json.dumps(ev.doc, indent=2) if a.json else f"{ev.doc['result']} {ev.path}")
     for r in ev.reasons:
         print(f"reason: {r}", file=sys.stderr)

@@ -38,3 +38,24 @@ def extract_block(agents_md: str) -> str:  # factory-owned AGENTS.md block, mark
 
 def drift_hash(text: str) -> str:
     return hashlib.sha256(text.replace("\r\n", "\n").strip().encode()).hexdigest()
+
+_SETUP = {"typescript": ("actions/setup-node@v4", "node-version", "node", "22"),
+          "javascript": ("actions/setup-node@v4", "node-version", "node", "22"),
+          "go": ("actions/setup-go@v5", "go-version", "go", "1.22")}
+_PIN = re.compile(r'checkout -q "([0-9a-f]{40})"')
+
+def render_workflow(manifest: dict, cli_sha: str) -> str:
+    """templates/factory.workflow.yml with the CLI mirror pinned and per-language setup (stack.toolchain wins)."""
+    if not re.fullmatch(r"[0-9a-f]{40}", cli_sha):
+        raise ValueError(f"FACTORY_CLI_SHA must be 40 hex, got {cli_sha!r}")
+    langs, tc = manifest["stack"]["languages"], manifest["stack"].get("toolchain") or {}
+    steps = "".join(f"      - uses: {a}\n        with:\n          {k}: \"{tc.get(t, d)}\"\n"
+                    for a, k, t, d in dict.fromkeys(_SETUP[x] for x in langs if x in _SETUP))
+    if "python" in langs:  # the gate runs the manifest's lint/test; the runner has neither
+        steps += "      - run: python -m pip install --quiet ruff pytest\n"
+    text = (TEMPLATES / "factory.workflow.yml").read_text().replace("      # {{TOOLCHAIN_STEPS}}\n", steps)
+    return render_text(text, manifest, FACTORY_CLI_SHA=cli_sha)
+
+def workflow_pin(text: str) -> str | None:
+    m = _PIN.search(text)
+    return m.group(1) if m else None
