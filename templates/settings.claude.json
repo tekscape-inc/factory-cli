@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(~/.ssh/**)",
+      "Read(~/.config/gh/**)",
+      "Read(~/.azure/**)",
+      "Read(~/.factory/biz/**)",
+      "Bash(ssh:*)",
+      "Bash(scp:*)",
+      "Bash(security:*)",
+      "Bash(rm -rf:*)",
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(gh auth token:*)",
+      "Bash(gh pr merge:*)",
+      "Bash(git push origin main:*)"
+    ]
+  }
+}

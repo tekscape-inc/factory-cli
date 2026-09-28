@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tekscape-inc/factory-standard/schema/card.schema.json",
+  "title": "Card — .factory/cards/<id>.json (plan v3 §4.4, 03 §3)",
+  "type": "object",
+  "required": ["id", "repo", "kind", "lane", "risk_class", "title", "spec", "acceptance", "success", "scope", "diff_budget"],
+  "additionalProperties": false,
+  "$defs": {
+    "sha1": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "strs": {"type": "array", "items": {"type": "string"}},
+    "who": {"type": "object", "required": ["vendor"], "additionalProperties": false,
+            "properties": {"vendor": {"enum": ["anthropic", "openai", "qwen"]}, "model": {"type": "string"}}}
+  },
+  "properties": {
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"},
+    "repo": {"type": "string", "pattern": "^[\\w.-]+/[\\w.-]+$"},
+    "kind": {"enum": ["feature", "fix", "chore", "gate-zero", "characterization"]},
+    "lane": {"enum": ["qwen", "coder-pro"]},
+    "risk_class": {"enum": ["low", "medium", "high"]},
+    "title": {"type": "string", "minLength": 1},
+    "spec": {"type": "string", "minLength": 1, "pattern": "^(\\S+\\s+){0,399}\\S*$"},
+    "acceptance": {
+      "type": "object", "required": ["criteria", "tests"], "additionalProperties": false,
+      "properties": {
+        "criteria": {"type": "array", "minItems": 1, "items": {
+          "type": "object", "required": ["id", "text", "verified_by"], "additionalProperties": false,
+          "properties": {"id": {"type": "string", "pattern": "^AC[0-9]+$"}, "text": {"type": "string"},
+                         "verified_by": {"type": "string"}}}},
+        "tests": {"type": "array", "items": {
+          "type": "object", "required": ["path", "sha256"], "additionalProperties": false,
+          "properties": {"path": {"type": "string"}, "sha256": {"$ref": "#/$defs/sha256"}}}}
+      }
+    },
+    "success": {
+      "type": "object", "required": ["run"], "additionalProperties": false,
+      "properties": {"run": {"type": "string", "minLength": 1},
+                     "timeout_s": {"type": "integer", "minimum": 1, "maximum": 3600, "default": 600}}
+    },
+    "scope": {
+      "type": "object", "required": ["writable"], "additionalProperties": false,
+      "properties": {"writable": {"$ref": "#/$defs/strs", "minItems": 1}, "out_of_scope": {"$ref": "#/$defs/strs"}}
+    },
+    "diff_budget": {
+      "type": "object", "required": ["files", "lines"], "additionalProperties": false,
+      "properties": {"files": {"type": "integer", "minimum": 1}, "lines": {"type": "integer", "minimum": 1}}
+    },
+    "deps": {
+      "type": "object", "additionalProperties": false,
+      "properties": {"allowed_new": {"type": "array", "default": [], "items": {
+        "type": "object", "required": ["ecosystem", "name"], "additionalProperties": false,
+        "properties": {"ecosystem": {"enum": ["pypi", "npm", "go"]}, "name": {"type": "string"},
+                       "range": {"type": "string"}}}}}
+    },
+    "depends_on": {"$ref": "#/$defs/strs"},
+    "author": {
+      "type": "object", "required": ["architect"], "additionalProperties": false,
+      "properties": {"architect": {"$ref": "#/$defs/who"},
+                     "implementer_vendor_excluded_from_judge": {"type": "boolean", "default": true}}
+    },
+    "frozen": {
+      "type": "object", "required": ["c0_sha", "card_sha256"], "additionalProperties": false,
+      "properties": {"c0_sha": {"$ref": "#/$defs/sha1"}, "card_sha256": {"$ref": "#/$defs/sha256"}}
+    }
+  }
+}

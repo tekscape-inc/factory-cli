@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tekscape-inc/factory-standard/schema/judge.schema.json",
+  "title": "Judge verdict — one JSON object, no PASS_WITH_CHANGES (plan v3 §5.3, 03 §4.3)",
+  "type": "object",
+  "required": ["verdict", "sha", "criteria", "findings"],
+  "additionalProperties": false,
+  "properties": {
+    "verdict": {"enum": ["PASS", "BLOCK", "HUMAN"]},
+    "sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "criteria": {"type": "array", "items": {
+      "type": "object", "required": ["id", "met", "evidence"], "additionalProperties": false,
+      "properties": {"id": {"type": "string"}, "met": {"type": "boolean"}, "evidence": {"type": "string"}}}},
+    "findings": {"type": "array", "items": {
+      "type": "object", "required": ["severity", "text"], "additionalProperties": false,
+      "properties": {"severity": {"enum": ["low", "medium", "high"]}, "text": {"type": "string"},
+                     "file": {"type": "string"}, "line": {"type": "integer", "minimum": 1}}}}
+  }
+}

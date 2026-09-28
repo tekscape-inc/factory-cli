@@ -1,0 +1,385 @@
+"""`factory gate`: the deterministic gate runner (plan v3 §3.1 step 8, §5.1, §5.2, §5.5).
+
+Everything here reads the card and acceptance tests from C0 (`git show`), never from the worktree,
+and the manifest from the base SHA. It never posts `factory/judge` (that is `factory judge`)."""
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import datetime
+import fnmatch
+import hashlib
+import importlib.metadata
+import json
+import os
+import pathlib
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import xml.etree.ElementTree as ET
+
+import yaml
+
+from factory import schemas
+from factory.doctor import run_command
+
+PROTECTED_BUILTIN = (
+    ".factory/**", "factory.yaml", ".github/**", "CODEOWNERS", ".github/CODEOWNERS",
+    "docs/CODEOWNERS", "orca.yaml", "AGENTS.md", "CLAUDE.md",
+    # test configs
+    "conftest.py", "**/conftest.py", "pytest.ini", "tox.ini", "jest.config.*", "vitest.config.*",
+    "playwright.config.*", ".mocharc*",
+)
+LOCKFILES = ("uv.lock", "poetry.lock", "Pipfile.lock", "requirements*.txt", "package-lock.json",
+             "pnpm-lock.yaml", "yarn.lock", "go.sum", "**/go.sum")
+REJECT_MARKERS = re.compile(r"\bt\.Skip(Now)?\(|\.only\(")
+FLAG_MARKERS = re.compile(r"@pytest\.mark\.(skip|xfail)|pytest\.skip\(|\bxit\(|\bxdescribe\(|"
+                          r"\.skip\(|@unittest\.skip|t\.SkipNow\(")
+
+
+def git(repo, *args: str, text: bool = True):
+    return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True,
+                          text=text).stdout
+
+
+def match(path: str, patterns) -> bool:
+    """fnmatch where `*` spans `/`; `**/x` also matches a top-level `x`; `dir/` matches a prefix."""
+    for pat in patterns:
+        if fnmatch.fnmatchcase(path, pat) or (pat.startswith("**/") and
+                                              fnmatch.fnmatchcase(path, pat[3:])):
+            return True
+        if pat.endswith("/") and path.startswith(pat):
+            return True
+    return False
+
+
+def load_card(repo, c0: str, card_id: str) -> tuple[dict, str]:
+    """The card as frozen in C0 and the sha256 of its exact bytes. The worktree copy is ignored."""
+    blob = git(repo, "show", f"{c0}:.factory/cards/{card_id}.json", text=False)
+    return json.loads(blob), hashlib.sha256(blob).hexdigest()
+
+
+def restore_acceptance(repo, c0: str, card: dict) -> list[str]:
+    """Overwrite each acceptance test in the worktree with its C0 bytes; return restored paths."""
+    restored = []
+    for t in card["acceptance"]["tests"]:
+        dest = pathlib.Path(repo) / t["path"]
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(git(repo, "show", f"{c0}:{t['path']}", text=False))
+        restored.append(t["path"])
+    return restored
+
+
+@dataclasses.dataclass
+class GateResult:
+    name: str
+    status: str  # pass | fail | absent
+    source: str = "builtin"
+    command: str | None = None
+    exit_code: int | None = None
+    tests: dict | None = None
+    duration_ms: int = 0
+    log_path: str | None = None
+    log_sha256: str | None = None
+
+    def to_json(self) -> dict:
+        return {k: v for k, v in dataclasses.asdict(self).items()
+                if v is not None or k in ("command", "exit_code", "tests")}
+
+
+@dataclasses.dataclass
+class ScopeResult:
+    result: str = "pass"  # pass | fail | tamper
+    reasons: list = dataclasses.field(default_factory=list)
+    flagged: list = dataclasses.field(default_factory=list)
+    human_gate: bool = False
+    files_changed: int = 0
+    lines_added: int = 0
+    lines_deleted: int = 0
+    budget: dict = dataclasses.field(default_factory=dict)
+    outside_writable: list = dataclasses.field(default_factory=list)
+    protected_touched: list = dataclasses.field(default_factory=list)
+    new_deps: list = dataclasses.field(default_factory=list)
+    acceptance_restored: bool = False
+    acceptance_modified_by_worker: list = dataclasses.field(default_factory=list)
+
+    def fail(self, reason: str, tamper: bool = False) -> None:
+        self.reasons.append(reason)
+        if tamper or self.result != "tamper":
+            self.result = "tamper" if tamper else "fail"
+
+    def to_json(self) -> dict:
+        skip = ("result", "reasons", "flagged", "human_gate")
+        return {k: v for k, v in dataclasses.asdict(self).items() if k not in skip}
+
+
+def _added_lines(repo, base: str, head: str) -> list[tuple[str, str]]:
+    out, path = [], None
+    for line in git(repo, "diff", "--no-renames", "-U0", base, head).splitlines():
+        if line.startswith("+++ "):
+            path = line[6:] if line.startswith("+++ b/") else None
+        elif line.startswith("+") and path:
+            out.append((path, line[1:]))
+    return out
+
+
+def scope_check(repo, base: str, head: str, card: dict, manifest: dict) -> ScopeResult:
+    """Tamper, budget, writable scope and skip markers for the worker's commits (`base` is C0)."""
+    r = ScopeResult(budget=dict(card["diff_budget"]))
+    files = []
+    for row in git(repo, "diff", "--numstat", "--no-renames", base, head).splitlines():
+        add, dele, path = row.split("\t", 2)
+        files.append(path)
+        r.lines_added += int(add) if add != "-" else 0
+        r.lines_deleted += int(dele) if dele != "-" else 0
+    r.files_changed = len(files)
+    paths = manifest.get("paths", {})
+    protected = [*PROTECTED_BUILTIN, *paths.get("tests", []), *paths.get("protected", [])]
+    deps_ok = bool(card.get("deps", {}).get("allowed_new"))
+    acceptance = {t["path"] for t in card["acceptance"]["tests"]}
+    required_for = manifest.get("owner_approval", {}).get("required_for", [])
+    for f in files:
+        if f in acceptance:
+            r.acceptance_modified_by_worker.append(f)
+        if match(f, LOCKFILES):
+            if not deps_ok:
+                r.protected_touched.append(f)
+            elif "new_dependency" in required_for:
+                r.human_gate = True
+        elif match(f, protected):
+            r.protected_touched.append(f)
+        if not match(f, card["scope"]["writable"]):
+            r.outside_writable.append(f)
+        if match(f, [p for p in required_for if "/" in p or "*" in p or "." in p]):
+            r.human_gate = True
+    if r.acceptance_modified_by_worker:
+        r.fail("acceptance_modified", tamper=True)
+    if r.protected_touched:
+        r.fail("protected_path", tamper=True)
+    for path, text in _added_lines(repo, base, head):
+        if REJECT_MARKERS.search(text):
+            r.fail(f"skip_marker:{path}", tamper=True)
+        elif FLAG_MARKERS.search(text):
+            r.flagged.append(f"{path}: {text.strip()}")
+    if r.outside_writable:
+        r.fail("outside_writable")
+    if (r.files_changed > r.budget["files"]
+            or r.lines_added + r.lines_deleted > r.budget["lines"]):
+        r.fail("over_budget")
+    return r
+
+
+def secrets_check(repo, base: str, head: str) -> GateResult:
+    """gitleaks on exactly the commits in base..head (8.30: `gitleaks git`; `detect` is deprecated)."""
+    argv = ["gitleaks", "git", "--log-opts", f"{base}..{head}", "--no-banner", "--redact",
+            "--exit-code", "1", str(repo)]
+    p = subprocess.run(argv, capture_output=True, text=True, check=False)
+    return GateResult("secrets", "pass" if p.returncode == 0 else "fail",
+                      command=" ".join(argv[:-1]), exit_code=p.returncode)
+
+
+# ---- P1-T8: manifest gates, acceptance, evidence.json, CI statuses, push + PR ----------------
+
+MANIFEST_GATES, LATE_GATES = ("setup", "build", "lint", "typecheck", "test"), ("boot", "e2e")
+
+
+class GateError(RuntimeError):
+    """The runner cannot proceed (e.g. push on a non-pass result, CI without a token)."""
+
+
+@dataclasses.dataclass
+class Evidence:
+    doc: dict  # schema/evidence.schema.json
+    reasons: list
+    flagged: list
+    human_gate: bool
+    path: pathlib.Path
+    sha256: str
+    card: dict
+    base_branch: str
+
+
+def _call(argv: list[str], cwd=None) -> str:
+    """The only door to `gh` and `git push` (tests replace it). Never used for factory/judge."""
+    return subprocess.run(argv, cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+
+
+def _now() -> str:
+    return datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _junit(report: pathlib.Path) -> dict:
+    root = ET.parse(report).getroot()
+    suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+    n = {k: sum(int(s.get(k, 0)) for s in suites) for k in ("tests", "failures", "errors", "skipped")}
+    return {"executed": n["tests"] - n["skipped"], "failed": n["failures"] + n["errors"],
+            "skipped": n["skipped"]}
+
+
+def _run(name: str, cmd: dict, source: str, repo: pathlib.Path, run_dir: pathlib.Path) -> GateResult:
+    """doctor.run_command (timeout, env, report + min_tests) with output teed to <run_dir>/<name>.log."""
+    log = run_dir / f"{name}.log"
+    wrapped = {**cmd, "run": f"( {cmd['run']}\n) > {shlex.quote(str(log))} 2>&1"}
+    r = run_command(name, wrapped, repo)
+    report = repo / cmd["report"] if cmd.get("report") else None
+    tests = _junit(report) if report and report.exists() else None
+    return GateResult(name, r["status"], source, cmd["run"], r["exit"], tests,
+                      int(r["duration_s"] * 1000), str(log),
+                      hashlib.sha256(log.read_bytes()).hexdigest() if log.exists() else None)
+
+
+def _base_executed(repo: pathlib.Path, base: str, cmd: dict) -> int | None:
+    """Tests executed by the base SHA's own test command, in a throwaway detached worktree."""
+    wt = pathlib.Path(tempfile.mkdtemp(prefix="factory-gate-base-")) / "wt"
+    git(repo, "worktree", "add", "-q", "--detach", str(wt), base)
+    try:
+        return run_command("test", cmd, wt)["executed"]
+    finally:
+        git(repo, "worktree", "remove", "--force", str(wt))
+
+
+def run_gate(repo, card_id: str, c0: str, attempt: int = 1, ci: bool = False,
+             runs_root=None) -> Evidence:
+    """Plan v3 §3.1 step 8: restore acceptance from C0 → secrets → scope → base-SHA manifest
+    commands → card success command → boot/e2e; write evidence.json; in --ci post 3 statuses."""
+    repo = pathlib.Path(repo).resolve()
+    started = _now()
+    head = git(repo, "rev-parse", "HEAD").strip()
+    base = git(repo, "rev-parse", f"{c0}^").strip()
+    card, card_sha = load_card(repo, c0, card_id)
+    raw = git(repo, "show", f"{base}:factory.yaml", text=False)  # base manifest, never head's
+    manifest = yaml.safe_load(raw)
+    gh = manifest["repo"]["github"]
+    root = runs_root or f"~/.factory/biz/{manifest['repo']['business']}/runs"
+    run_dir = pathlib.Path(root).expanduser() / gh.split("/")[1] / card_id / str(attempt)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    restored = restore_acceptance(repo, c0, card)
+    gates = [secrets_check(repo, base, head)]
+    scope = scope_check(repo, c0, head, card, manifest)
+    scope.acceptance_restored = bool(restored)
+    if ci and git(repo, "diff", "--name-only", base, head, "--", ".github").strip():
+        scope.fail("workflow_changed_vs_base", tamper=True)  # Review focus 1
+    gates.append(GateResult("scope", "pass" if scope.result == "pass" else "fail"))
+    cmds = manifest["commands"]
+    plan = [(n, cmds.get(n), "manifest") for n in MANIFEST_GATES]
+    plan += [("acceptance", card["success"], "card")]
+    plan += [(n, cmds.get(n), "manifest") for n in LATE_GATES]
+    for name, cmd, source in plan:
+        gates.append(_run(name, cmd, source, repo, run_dir) if cmd
+                     else GateResult(name, "absent", source))
+
+    reasons = [*scope.reasons] + (["secrets"] if gates[0].status != "pass" else [])
+    required = {g["name"]: g["required"] for g in manifest.get("gates", [])}
+    for g in gates[2:]:
+        if g.status == "fail" or (g.status == "absent" and required.get(g.name, g.name == "acceptance")):
+            reasons.append(f"gate_{g.status}:{g.name}")
+    test = next(g for g in gates if g.name == "test")
+    if test.tests is not None:
+        floor = _base_executed(repo, base, cmds["test"])
+        if floor is not None and test.tests["executed"] < floor:
+            reasons.append("tests_below_base")
+    tamper = scope.result == "tamper" or "tests_below_base" in reasons
+    result = "tamper" if tamper else "fail" if reasons else "pass"
+
+    try:
+        version = importlib.metadata.version("factory-standard")
+    except importlib.metadata.PackageNotFoundError:
+        version = "0.0.0"
+    doc = {"schema_version": 1,
+           "card": {"id": card_id, "c0_sha": git(repo, "rev-parse", c0).strip(),
+                    "card_sha256": card_sha},
+           "repo": {"github": gh, "base_sha": base, "head_sha": head,
+                    "tree_sha": git(repo, "rev-parse", f"{head}^{{tree}}").strip()},
+           "attempt": {"n": attempt, "lane": card["lane"], "started_at": started,
+                       "finished_at": _now()},
+           "runner": {"factory_version": version, "host": "gha" if ci else "mac-local",
+                      "manifest_sha256": hashlib.sha256(raw).hexdigest()},
+           "gates": [g.to_json() for g in gates], "scope": scope.to_json(), "artifacts": [],
+           "judge": None, "result": result}
+    schemas.validate("evidence", doc)
+    path = run_dir / "evidence.json"
+    path.write_text(json.dumps(doc, indent=2) + "\n")
+    ev = Evidence(doc, reasons, scope.flagged, card["risk_class"] == "high" or scope.human_gate,
+                  path, hashlib.sha256(path.read_bytes()).hexdigest(), card,
+                  manifest["repo"].get("base_branch", "main"))
+    if ci:
+        post_ci_statuses(ev, repo)
+    return ev
+
+
+def post_ci_statuses(ev: Evidence, repo) -> None:
+    """Exactly factory/secrets, factory/scope, factory/gates on head_sha. Never factory/judge."""
+    if not (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")):
+        raise GateError("--ci needs GITHUB_TOKEN")
+    gates_ok = not any(r.startswith("gate_") or r == "tests_below_base" for r in ev.reasons)
+    oks = {"secrets": ev.doc["gates"][0]["status"] == "pass",
+           "scope": ev.doc["gates"][1]["status"] == "pass", "gates": gates_ok}
+    for name, ok in oks.items():
+        _call(["gh", "api", "-X", "POST",
+               f"repos/{ev.doc['repo']['github']}/statuses/{ev.doc['repo']['head_sha']}",
+               "-f", f"state={'success' if ok else 'failure'}", "-f", f"context=factory/{name}",
+               "-f", f"description=result={ev.doc['result']} evidence {ev.sha256[:12]}"], cwd=repo)
+
+
+def _judge_required(ev: Evidence, repo) -> bool:
+    """True iff the base branch's active rules require the factory/judge status."""
+    path = f"repos/{ev.doc['repo']['github']}/rules/branches/{ev.base_branch}"
+    rules = json.loads(_call(["gh", "api", path], cwd=repo) or "[]")
+    return any(c.get("context") == "factory/judge" for r in rules
+               if r.get("type") == "required_status_checks"
+               for c in r.get("parameters", {}).get("required_status_checks", []))
+
+
+def push(ev: Evidence, repo) -> str:
+    """Push the gated head SHA to factory/<card>, open the PR, post ONE evidence comment, then
+    `gh pr merge --auto --squash` unless HUMAN_GATE. Merging itself stays with GitHub + ruleset."""
+    d = ev.doc
+    if d["result"] != "pass":
+        raise GateError(f"refusing to push: result={d['result']} {ev.reasons}")
+    branch = f"factory/{d['card']['id']}"
+    _call(["git", "push", "origin", f"{d['repo']['head_sha']}:refs/heads/{branch}"], cwd=repo)
+    rows = [f"| {g['name']} | {g['status']} | {g.get('exit_code')} | {g.get('tests') or ''} |"
+            for g in d["gates"]]
+    summary, body = ev.path.with_name("summary.md"), ev.path.with_name("pr-body.md")
+    summary.write_text("\n".join([
+        f"### factory gate: `{d['result']}`", "", f"evidence sha256: `{ev.sha256}`",
+        (f"head `{d['repo']['head_sha']}` · base `{d['repo']['base_sha']}` · "
+         f"C0 `{d['card']['c0_sha']}`"), "", "| gate | status | exit | tests |", "|---|---|---|---|",
+        *rows, *([""] + [f"flagged: {f}" for f in ev.flagged] if ev.flagged else [])]) + "\n")
+    body.write_text(f"Card `{d['card']['id']}` frozen at C0 `{d['card']['c0_sha']}`.\n\n"
+                    f"{ev.card['title']}\n\nGate evidence is in the first comment.\n")
+    url = _call(["gh", "pr", "create", "--base", ev.base_branch, "--head", branch, "--title",
+                 f"{d['card']['id']}: {ev.card['title']}", "--body-file", str(body)], cwd=repo)
+    _call(["gh", "pr", "comment", url, "--body-file", str(summary)], cwd=repo)
+    if ev.human_gate:
+        print(f"HUMAN_GATE {url}")
+    elif not _judge_required(ev, repo):  # gh merges a CLEAN PR at once: --auto would skip the judge
+        print(f"NO_RULESET {url}")
+    else:
+        _call(["gh", "pr", "merge", "--auto", "--squash", "--match-head-commit",
+               d["repo"]["head_sha"], url], cwd=repo)
+    print(url)
+    return url
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="factory gate", description=__doc__)
+    ap.add_argument("--card", required=True)
+    ap.add_argument("--c0", required=True)
+    ap.add_argument("--attempt", type=int, default=1)
+    ap.add_argument("--repo", default=".")
+    ap.add_argument("--runs-root")
+    ap.add_argument("--ci", action="store_true", help="post factory/{secrets,scope,gates}")
+    ap.add_argument("--push", action="store_true", help="on pass: push, PR, evidence comment, --auto")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args(argv)
+    ev = run_gate(a.repo, a.card, a.c0, a.attempt, ci=a.ci, runs_root=a.runs_root)
+    print(json.dumps(ev.doc, indent=2) if a.json else f"{ev.doc['result']} {ev.path}")
+    for r in ev.reasons:
+        print(f"reason: {r}", file=sys.stderr)
+    if a.push and ev.doc["result"] == "pass":
+        push(ev, a.repo)
+    return 0 if ev.doc["result"] == "pass" else 1

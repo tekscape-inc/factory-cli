@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tekscape-inc/factory-standard/schema/factory.schema.json",
+  "title": "factory.yaml — the repo contract (plan v3 §4.1, 03 §2.1)",
+  "type": "object",
+  "required": ["version", "repo", "stack", "commands", "paths", "risk_class"],
+  "additionalProperties": false,
+  "$defs": {
+    "strs": {"type": "array", "items": {"type": "string"}},
+    "cmd_obj": {
+      "type": "object", "required": ["run"], "additionalProperties": false,
+      "properties": {
+        "run": {"type": "string", "minLength": 1},
+        "timeout_s": {"type": "integer", "minimum": 1, "maximum": 3600, "default": 900},
+        "env": {"type": "object", "additionalProperties": {"type": "string"}},
+        "report": {"type": "string", "minLength": 1},
+        "min_tests": {"type": "integer", "minimum": 1, "default": 1}
+      }
+    },
+    "cmd": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/cmd_obj"}]},
+    "reported_cmd": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/cmd_obj", "required": ["run", "report"]}]}
+  },
+  "properties": {
+    "version": {"const": 1},
+    "repo": {
+      "type": "object", "required": ["github", "base_branch", "business"], "additionalProperties": false,
+      "properties": {
+        "github": {"type": "string", "pattern": "^[\\w.-]+/[\\w.-]+$"},
+        "base_branch": {"type": "string", "default": "main"},
+        "business": {"enum": ["tekscape", "manafuel", "cedar-gate", "home"]},
+        "customer": {"type": ["string", "null"]}
+      }
+    },
+    "stack": {
+      "type": "object", "required": ["languages"], "additionalProperties": false,
+      "properties": {
+        "languages": {"type": "array", "minItems": 1,
+          "items": {"enum": ["python", "typescript", "javascript", "go", "csharp", "powershell", "other"]}},
+        "toolchain": {"type": "object", "additionalProperties": {"type": "string"}}
+      }
+    },
+    "commands": {
+      "type": "object", "required": ["setup", "build", "lint", "test"], "additionalProperties": false,
+      "properties": {
+        "setup": {"$ref": "#/$defs/cmd"}, "build": {"$ref": "#/$defs/cmd"}, "lint": {"$ref": "#/$defs/cmd"},
+        "typecheck": {"$ref": "#/$defs/cmd"}, "boot": {"$ref": "#/$defs/cmd"},
+        "test": {"$ref": "#/$defs/reported_cmd"}, "e2e": {"$ref": "#/$defs/reported_cmd"}
+      }
+    },
+    "paths": {
+      "type": "object", "required": ["src", "tests"], "additionalProperties": false,
+      "properties": {
+        "src": {"$ref": "#/$defs/strs"}, "tests": {"$ref": "#/$defs/strs"},
+        "protected": {"$ref": "#/$defs/strs"}, "generated": {"$ref": "#/$defs/strs"}
+      }
+    },
+    "gates": {
+      "type": "array",
+      "items": {
+        "type": "object", "required": ["name", "required"], "additionalProperties": false,
+        "properties": {
+          "name": {"enum": ["secrets", "scope", "setup", "build", "lint", "typecheck", "test",
+                            "acceptance", "e2e", "boot", "judge", "human"]},
+          "required": {"type": "boolean"}
+        },
+        "if": {"properties": {"name": {"enum": ["secrets", "scope", "judge"]}}},
+        "then": {"properties": {"required": {"const": true}}}
+      }
+    },
+    "environments": {
+      "type": "array",
+      "items": {
+        "type": "object", "required": ["name", "kind"], "additionalProperties": false,
+        "properties": {
+          "name": {"type": "string"},
+          "kind": {"enum": ["local", "preview", "staging", "production"]},
+          "url": {"type": "string"},
+          "secret_refs": {"$ref": "#/$defs/strs"},
+          "agent_access": {"enum": ["none", "read", "write"], "default": "none"}
+        }
+      }
+    },
+    "journeys": {
+      "type": "array",
+      "items": {
+        "type": "object", "required": ["id", "description"], "additionalProperties": false,
+        "properties": {
+          "id": {"type": "string", "pattern": "^[a-z0-9-]+$"},
+          "description": {"type": "string"},
+          "command": {"type": "string"}
+        }
+      }
+    },
+    "risk_class": {"enum": ["low", "medium", "high"]},
+    "credential_scope": {"$ref": "#/$defs/strs", "default": []},
+    "owner_approval": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "approvers": {"$ref": "#/$defs/strs"},
+        "required_for": {"type": "array", "items": {"enum": ["risk_high", "new_dependency", "migration",
+          "auth", "billing", "secrets", "ci_change", "public_api"]}}
+      }
+    },
+    "lanes": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "qwen": {"type": "boolean", "default": true},
+        "default_diff_budget": {
+          "type": "object", "additionalProperties": false,
+          "properties": {"files": {"type": "integer", "minimum": 1, "default": 8},
+                         "lines": {"type": "integer", "minimum": 1, "default": 300}}
+        }
+      }
+    },
+    "enforcement": {"enum": ["enforced", "advisory", "none"], "readOnly": true}
+  }
+}
