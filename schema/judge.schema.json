@@ -15,7 +15,7 @@
       "type": "object", "required": ["severity", "text"], "additionalProperties": false,
       "properties": {"severity": {"enum": ["low", "medium", "high"]}, "text": {"type": "string"},
                      "file": {"type": "string"}, "line": {"type": "integer", "minimum": 1}}}},
-    "artifacts_observed": {"type": "array", "items": {"type": "object", "required": ["path", "observation"], "additionalProperties": false, "properties": {"path": {"type": "string"}, "observation": {"type": "string"}}}},
+    "artifacts_observed": {"type": "array", "items": {"type": "object", "required": ["path", "observation"], "additionalProperties": false, "properties": {"path": {"type": "string"}, "observation": {"type": ["string", "integer"]}}}},
     "artifacts_verified": {"type": "integer", "minimum": 0}
   }
 }

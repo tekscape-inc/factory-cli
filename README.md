@@ -1,3 +1,3 @@
 # factory-cli
 
-Code-only mirror of the Hermes Factory Standard CLI (source `007c5a81fa3434ec3bc242200fae0e05f5b4fccb`). Install: `pip install -e .`
+Code-only mirror of the Hermes Factory Standard CLI (source `cc6c6118555e59e2166d67db73215e411f1dd5ed`). Install: `pip install -e .`

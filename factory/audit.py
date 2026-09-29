@@ -15,6 +15,7 @@ from factory import judge
 from factory.orca import FACTORY_HOME
 
 INCIDENTS = FACTORY_HOME / "incidents.jsonl"
+POLICY = FACTORY_HOME / "audit-policy.json"  # written by factory-watch when an audit miss is confirmed real
 FIRST_N = 10
 
 
@@ -36,7 +37,13 @@ def prior_passes(repo: str, runs: pathlib.Path) -> int:
 def sampled(card_id: str, c0: str, repo: str | None = None, runs: pathlib.Path | None = None) -> bool:
     if repo is not None and prior_passes(repo, runs or runs_root()) < FIRST_N:
         return True
-    return int(hashlib.sha256((card_id + c0).encode()).hexdigest(), 16) % 10 == 0
+    h = int(hashlib.sha256((card_id + c0).encode()).hexdigest(), 16)
+    pol = json.loads(POLICY.read_text()) if POLICY.exists() else {}
+    if pol.get("cards_left", 0) > 0:  # raised rate for the next N cards (P4-T3); decremented per card
+        POLICY.write_text(json.dumps(dict(pol, cards_left=pol["cards_left"] - 1)))
+        if h % 100 < pol.get("sample_pct", 10):
+            return True
+    return h % 10 == 0
 
 
 def auditor_for(judge: str) -> str:

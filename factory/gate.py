@@ -390,8 +390,10 @@ def push(ev: Evidence, repo) -> str:
         *rows, *([""] + [f"flagged: {f}" for f in ev.flagged] if ev.flagged else [])]) + "\n")
     body.write_text(f"Card `{d['card']['id']}` frozen at C0 `{d['card']['c0_sha']}`.\n\n"
                     f"{ev.card['title']}\n\nGate evidence is in the first comment.\n")
-    url = _call(["gh", "pr", "create", "--base", ev.base_branch, "--head", branch, "--title",
-                 f"{d['card']['id']}: {ev.card['title']}", "--body-file", str(body)], cwd=repo)
+    url = _call(["gh", "pr", "list", "--head", branch, "--state", "open", "--json", "url", "-q",
+                 ".[0].url // empty"], cwd=repo) or _call([  # attempt n+1 (P3-T6): reuse the open PR
+        "gh", "pr", "create", "--base", ev.base_branch, "--head", branch, "--title",
+        f"{d['card']['id']}: {ev.card['title']}", "--body-file", str(body)], cwd=repo)
     _call(["gh", "pr", "comment", url, "--body-file", str(summary)], cwd=repo)
     reasons = ",".join(d["scope"]["human_gate_reasons"])
     print(f"HUMAN_GATE {url} reason={reasons}" if ev.human_gate else f"GATED {url}")

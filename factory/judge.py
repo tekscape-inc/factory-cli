@@ -188,7 +188,7 @@ def run(evidence_path: str, vendor: str | None = None, repo: str | None = None, 
     (run_dir / f"{name}.stderr.txt").write_text((proc.stderr or "")[-4000:])
     verdict = (parse_verdict(answer, head, card) if proc.returncode == 0 and answer.strip()
                else _block(head, f"judge process failed (rc={proc.returncode})"))
-    seen = {o["path"].removeprefix(".factory/artifacts/"): o["observation"] for o in verdict.get("artifacts_observed", [])}
+    seen = {o["path"].removeprefix(".factory/artifacts/"): str(o["observation"]) for o in verdict.get("artifacts_observed", [])}
     arts = [a for a in ev.get("artifacts", []) if not a.get("skipped")]
     ok = [a["path"] for a in arts if seen.get(a["path"]) == _observe(stage / a["path"]) != "unreadable"]
     strong = [a["path"] for a in arts if not a["path"].endswith(".png")] or ok   # png <w>x<h> is guessable
