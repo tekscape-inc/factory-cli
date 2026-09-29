@@ -66,10 +66,12 @@ Keep it to 2–4 lines. Include the PR link. Do not paste logs or code into Tele
 
 ## 5. Onboarding (normally automatic)
 
-`work.sh` onboards on first use. Run `bash $S/onboard.sh <path> [--base <branch>] [--test-cmd "<cmd>"]` yourself
-only to fix the drafted manifest (wrong test command, non-`main` base branch, repo outside `~/dev`). It writes a
-registry row and an out-of-repo manifest under `~/.factory/biz/tekscape/manifests/`. Report what it printed; if it
-refuses, report why and stop. Do not hand-edit `repos.tsv`.
+`work.sh` onboards on first use. Run `bash $S/onboard.sh <path> --redraft [--base <branch>] [--setup-cmd|--test-cmd "<cmd>"]`
+yourself only to fix the drafted manifest (wrong test command, non-`main` base branch, repo outside `~/dev`). Given
+commands are kept on later redrafts; the rest is re-inferred. If the repo's tests already fail on its base branch, add
+`--baseline`: it runs them once, records the failing tests beside the manifest, and from then on a card fails only on
+NEW failures. It writes a registry row and an out-of-repo manifest under `~/.factory/biz/tekscape/manifests/`. Report
+what it printed; if it refuses, report why and stop. Do not hand-edit `repos.tsv` or the manifests.
 
 ## 6. What John does
 
