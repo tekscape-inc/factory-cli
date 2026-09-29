@@ -24,7 +24,7 @@ import time
 
 import yaml
 
-from factory import schemas
+from factory import repos, schemas
 from factory.doctor import junit_counts, run_command
 
 PROTECTED_BUILTIN = (
@@ -138,11 +138,10 @@ def scope_check(repo, base: str, head: str, card: dict, manifest: dict) -> Scope
         r.lines_deleted += int(dele) if dele != "-" else 0
     r.files_changed = len(files)
     paths = manifest.get("paths", {})
-    protected = [*PROTECTED_BUILTIN, *paths.get("tests", []), *paths.get("protected", [])]
-    writable = card["scope"]["writable"]
-    if card.get("kind") == "characterization":  # inverted rule: tests writable, source protected
-        protected = [*PROTECTED_BUILTIN, *paths.get("src", []), *paths.get("protected", [])]
-        writable = paths.get("tests", [])
+    hard = [*PROTECTED_BUILTIN, *paths.get("protected", [])]
+    protected, writable = [*hard, *paths.get("tests", [])], card["scope"]["writable"]
+    if char := card.get("kind") == "characterization":  # inverted: tests writable, src protected; tests win over a broad src ('**')
+        protected, writable = [*hard, *paths.get("src", [])], paths.get("tests", [])
     deps_ok = bool(card.get("deps", {}).get("allowed_new"))
     acceptance = {t["path"] for t in card["acceptance"]["tests"]}
     required_for = manifest.get("owner_approval", {}).get("required_for", [])
@@ -154,7 +153,7 @@ def scope_check(repo, base: str, head: str, card: dict, manifest: dict) -> Scope
                 r.protected_touched.append(f)
             elif "new_dependency" in required_for:
                 r.human_gate_reasons.append("new_dependency")
-        elif match(f, protected):
+        elif match(f, protected) and not (char and match(f, writable) and not match(f, hard)):
             r.protected_touched.append(f)
         if not match(f, writable):
             r.outside_writable.append(f)
@@ -295,7 +294,12 @@ def run_gate(repo, card_id: str, c0: str, attempt: int = 1, ci: bool = False,
     head = git(repo, "rev-parse", "HEAD").strip()
     base = git(repo, "rev-parse", f"{c0}^").strip()
     card, card_sha = load_card(repo, c0, card_id)
-    raw = git(repo, "show", f"{base}:factory.yaml", text=False)  # base manifest, never head's
+    try:
+        raw = git(repo, "show", f"{base}:factory.yaml", text=False)  # base manifest, never head's
+    except subprocess.CalledProcessError:   # eng-R3: owner-merge repos keep theirs in the overlay
+        if not (ov := repos.overlay_for(repo)):
+            raise
+        raw = ov.read_bytes()
     manifest = yaml.safe_load(raw)
     gh = manifest["repo"]["github"]
     root = runs_root or f"~/.factory/biz/{manifest['repo']['business']}/runs"

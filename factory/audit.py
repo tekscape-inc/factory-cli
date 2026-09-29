@@ -11,7 +11,7 @@ import os
 import pathlib
 import time
 
-from factory import judge
+from factory import judge, repos
 from factory.orca import FACTORY_HOME
 
 INCIDENTS = FACTORY_HOME / "incidents.jsonl"
@@ -56,7 +56,7 @@ def run(evidence_path: str, merged_sha: str, judge_vendor: str | None = None,
     ev = json.loads(pathlib.Path(evidence_path).read_text())
     primary = judge_vendor or judge.judge_vendor((ev["attempt"].get("author") or {}).get("vendor", "qwen"))
     auditor = auditor_for(primary)
-    clone = os.path.expanduser(repo or f"~/factory-samples/{ev['repo']['github'].split('/')[1]}")
+    clone = os.path.expanduser(repo or repos.clone_for(ev["repo"]["github"]))
     gated = ev["repo"].get("head_sha", "")
     t_gated, t_merged = (judge._git(clone, "rev-parse", f"{s}^{{tree}}") for s in (gated, merged_sha))
     if t_gated != t_merged:                        # something other than the gated head reached the base branch

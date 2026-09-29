@@ -10,7 +10,7 @@ Worked example: `tests/fixtures/cards/greet-001.json` in `factory-standard`. Sch
 
 ## 0. Refuse or ask first
 
-- Read `factory.yaml`, `AGENTS.md`, and the source the change touches. Do not guess past them.
+- Read `factory.yaml` (or, when the repo keeps none, the manifest path the prompt gives you), `AGENTS.md`, and the source the change touches. Do not guess past them.
 - If the request is ambiguous, needs a secret, or names code you cannot find: write **nothing**; reply with one line
   `NEEDS_CONTEXT: <the specific question>` and stop. `NEEDS_CONTEXT` returns the card to you (or to John) and is
   **not** an attempt. A worker may also send `NEEDS_CONTEXT` back on your card: answer by writing a new card `<id>.v2`

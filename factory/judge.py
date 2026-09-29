@@ -20,7 +20,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 from factory import card as cardlib
-from factory import ghapp, schemas
+from factory import ghapp, repos, schemas
 
 SKILL = pathlib.Path(__file__).resolve().parent.parent / "skills" / "judge" / "SKILL.md"
 OTHER = {"claude": "codex", "anthropic": "codex", "qwen": "codex", "codex": "claude", "openai": "claude"}
@@ -166,7 +166,7 @@ def run(evidence_path: str, vendor: str | None = None, repo: str | None = None, 
     """Judge one attempt; `sha`/`base`/`name` let `factory audit` re-judge the merged commit."""
     ev = json.loads(pathlib.Path(evidence_path).read_text())
     run_dir = pathlib.Path(evidence_path).resolve().parent
-    repo = os.path.expanduser(repo or f"~/factory-samples/{ev['repo']['github'].split('/')[1]}")
+    repo = os.path.expanduser(repo or repos.clone_for(ev["repo"]["github"]))
     head, base = sha or ev["repo"]["head_sha"], base or ev["repo"]["base_sha"]
     vendor = vendor or judge_vendor((ev["attempt"].get("author") or {}).get("vendor", "qwen"))
     card = json.loads(_git(repo, "show", f"{ev['card']['c0_sha']}:.factory/cards/{ev['card']['id']}.json"))
@@ -219,7 +219,7 @@ def verify_binding(doc: dict, ev: dict, repo: str, pr: int, clone: str | None = 
     """Why this PASS may NOT become `factory/judge=success` (empty = bound): CI statuses are forgeable
     by branch code, so the App's PASS is the binding point — local-harness evidence, App-stamped C0
     that branched from the real base, and the card hash re-derived from C0 (Codex #1, #2)."""
-    clone = os.path.expanduser(clone or f"~/factory-samples/{repo.split('/')[1]}")
+    clone = os.path.expanduser(clone or repos.clone_for(repo))
     c0, why = ev["card"]["c0_sha"], []
     try:
         pr_doc = _pr(repo, pr)

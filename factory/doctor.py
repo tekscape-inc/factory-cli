@@ -17,7 +17,7 @@ import xml.etree.ElementTree as ET
 
 import yaml
 
-from factory import schemas, templates
+from factory import repos, schemas, templates
 
 LEVELS = ("L0", "L1", "L2", "L3")
 NEEDS = {"L1": ("build", "lint", "secrets", "boot"), "L2": ("test",), "L3": ("e2e",)}
@@ -316,12 +316,13 @@ def main(argv: list[str]) -> int:
     repo = pathlib.Path(a.repo).expanduser()
     fy = repo / "factory.yaml"
     try:
-        if a.level not in LEVELS[1:]:
-            raise DoctorError(f"--level must be one of L1 L2 L3, got {a.level!r}")
+        if a.level not in LEVELS:   # L0 = report only (scripts/onboard.sh)
+            raise DoctorError(f"--level must be one of L0 L1 L2 L3, got {a.level!r}")
         if not repo.is_dir():
             raise DoctorError(f"not a directory: {repo}")
         if a.init and not fy.exists():
             fy.write_text(yaml.safe_dump(infer(repo), sort_keys=False))
+        fy = fy if fy.exists() else repos.overlay_for(repo) or fy   # eng-R3: owner-merge overlay
         if not fy.exists():
             raise DoctorError(f"no factory.yaml in {repo} (run with --init)")
         manifest = yaml.safe_load(fy.read_text())

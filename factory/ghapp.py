@@ -6,11 +6,13 @@ import base64
 import datetime as dt
 import json
 import subprocess
+import sys
 import time
 import urllib.request
 
 import jwt
 
+from factory import repos
 from factory.orca import FACTORY_HOME, LEDGER
 
 API = "https://api.github.com"
@@ -74,6 +76,8 @@ def ledger(row: dict) -> None:
 
 def post_status(repo: str, sha: str, context: str, state: str, description: str) -> dict:
     """POST /repos/<repo>/statuses/<sha> as the App, then append a `status_post` ledger row."""
+    if (repos.by_slug(repo) or {}).get("mode") == "owner-merge":   # the App is not installed there
+        return print(f"[mode] owner-merge: App status {context} skipped", file=sys.stderr) or {}
     doc = _http("POST", f"/repos/{repo}/statuses/{sha}", "token " + installation_token(),
                 {"state": state, "context": context, "description": description[:140]})
     ledger({"kind": "status_post", "repo": repo, "sha": sha, "context": context, "state": state,
