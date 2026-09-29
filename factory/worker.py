@@ -16,7 +16,10 @@ from factory import orca
 ALLOWED = {"PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL", "TERM",
            "COLORTERM"}
 AGENTS = {"claude": "claude --dangerously-skip-permissions",
-          "codex": "codex --dangerously-bypass-approvals-and-sandbox"}
+          "codex": "codex --dangerously-bypass-approvals-and-sandbox",
+          # Qwen lane: wrappers mint a qwen-gate session token themselves (P2-T7); ALLOWED is unchanged
+          "opencode": os.path.expanduser("~/.factory/bin/qwen-opencode"),
+          "aider": os.path.expanduser("~/.factory/bin/qwen-aider")}
 CLAUDE_JSON, CODEX_TOML = "~/.claude.json", "~/.codex/config.toml"
 
 
@@ -92,7 +95,7 @@ def start(repo: str, card: str, agent: str, prompt: str, business: str = "teksca
     c0 = c0 or subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"], capture_output=True,
                               text=True, check=True).stdout.strip()
     wt = orca.orca("worktree", "create", repo=f"path:{repo}", name=card, setup="skip",
-                   no_parent=True)["worktree"]["path"]
+                   no_parent=True, base_branch=c0)["worktree"]["path"]  # the worker starts at C0
     try:
         trust(wt)
         env = build_env(business, lane, card, c0)

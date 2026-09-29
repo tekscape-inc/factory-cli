@@ -41,6 +41,10 @@ Worked example: `tests/fixtures/cards/greet-001.json` in `factory-standard`. Sch
 
 `diff_budget`: qwen ≤ 3 files / 300 lines; coder-pro from `lanes.default_diff_budget`, else 8 files / 300 lines.
 `risk_class`: the higher of the manifest's and the change's own; round up when in doubt (`policy/risk.md`).
+**`risk_class` is `high` whenever the change falls in any manifest `owner_approval.required_for` category** (e.g.
+`public_api`: a changed signature, new parameter, new CLI flag or removed symbol; `new_dependency`). Categories are not
+paths, so the gate cannot detect them; `high` is what makes the gate stop at `HUMAN_GATE` (auto-merge not armed) instead of
+letting the judge discover it after auto-merge is armed. Say which category in `spec`.
 
 ## 3. The card
 

@@ -49,8 +49,18 @@ def run(evidence_path: str, merged_sha: str, judge_vendor: str | None = None,
     ev = json.loads(pathlib.Path(evidence_path).read_text())
     primary = judge_vendor or judge.judge_vendor((ev["attempt"].get("author") or {}).get("vendor", "qwen"))
     auditor = auditor_for(primary)
-    out = judge.run(evidence_path, vendor=auditor, repo=repo, sha=merged_sha, base=f"{merged_sha}^",
-                    name="audit")
+    clone = os.path.expanduser(repo or f"~/factory-samples/{ev['repo']['github'].split('/')[1]}")
+    gated = ev["repo"].get("head_sha", "")
+    t_gated, t_merged = (judge._git(clone, "rev-parse", f"{s}^{{tree}}") for s in (gated, merged_sha))
+    if t_gated != t_merged:                        # something other than the gated head reached the base branch
+        out = judge._block(merged_sha, f"merged tree {t_merged} != gated head {gated} tree {t_gated}")
+        out["vendor"] = auditor
+    else:
+        note = (f"Harness fact (verified with git, not from the worker): merged commit {merged_sha} is the squash of "
+                f"gated head {gated}; their trees are identical ({t_merged}). The evidence.json gate results for "
+                f"{gated} therefore apply to {merged_sha}.")
+        out = judge.run(evidence_path, vendor=auditor, repo=repo, sha=merged_sha, base=f"{merged_sha}^",
+                        name="audit", note=note)
     miss = out["verdict"] == "BLOCK" and any(f["severity"] == "high" for f in out["findings"])
     if miss:
         INCIDENTS.parent.mkdir(parents=True, exist_ok=True)

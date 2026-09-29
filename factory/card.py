@@ -8,6 +8,7 @@ import json
 import os
 import pathlib
 import subprocess
+import sys
 import tempfile
 
 from factory import ghapp, schemas
@@ -63,14 +64,42 @@ def freeze(repo: str, card_id: str, base: str = "origin/main", push: bool = True
             "card_sha256": digest, "status": "success"}
 
 
+def restamp(repo: str, card_id: str, c0: str) -> int | None:  # C0' is stamped only if its bytes match
+    rel = f".factory/cards/{card_id}.json"
+    digest = json.loads(pathlib.Path(repo, rel).read_text()).get("frozen", {}).get("card_sha256")
+    raw = subprocess.run(["git", "-C", repo, "show", f"{c0}:{rel}"], capture_output=True, check=False).stdout
+    if hashlib.sha256(raw).hexdigest() != digest:
+        return print(f"{card_id}: card at {c0} != frozen sha256; not restamped", file=sys.stderr) or 2
+    for t in json.loads(raw)["acceptance"]["tests"]:  # frozen acceptance bytes must survive the rebase too
+        blob = subprocess.run(["git", "-C", repo, "show", f"{c0}:{t['path']}"], capture_output=True, check=False).stdout
+        if hashlib.sha256(blob).hexdigest() != t["sha256"]:
+            return print(f"{card_id}: {t['path']} at {c0} != card sha256; not restamped", file=sys.stderr) or 2
+    ghapp.post_status(json.loads(raw)["repo"], c0, "factory/card", "success", f"{card_id} restamped {digest[:12]}")
+
+
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(prog="factory card")
-    p.add_argument("--freeze", action="store_true", required=True)
-    p.add_argument("--repo", required=True)
-    p.add_argument("--card", required=True)
+    mode = p.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--freeze", action="store_true")
+    mode.add_argument("--validate", metavar="CARD_JSON", help="schema-check a card file; exit 0/1")
+    mode.add_argument("--restamp", metavar="C0_SHA", help="restamp a rebased C0")
+    p.add_argument("--repo")
+    p.add_argument("--card")
     p.add_argument("--base", default="origin/main")
     p.add_argument("--json", action="store_true")
     a = p.parse_args(argv)
+    if a.validate:
+        try:
+            schemas.validate("card", json.loads(pathlib.Path(a.validate).read_text()))
+        except (schemas.SchemaError, ValueError, OSError) as exc:
+            print(f"{a.validate}: {exc}", file=sys.stderr)
+            return 1
+        print(f"{a.validate}: valid card")
+        return 0
+    if not (a.repo and a.card):
+        p.error("--freeze needs --repo and --card")
+    if a.restamp:
+        return restamp(os.path.expanduser(a.repo), a.card, a.restamp) or 0
     out = freeze(os.path.expanduser(a.repo), a.card, base=a.base)
     print(json.dumps(out) if a.json else f"{out['card']}: C0 {out['c0_sha']} on {out['branch']}")
     return 0

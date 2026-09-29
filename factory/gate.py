@@ -16,9 +16,11 @@ import pathlib
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 
 import yaml
@@ -138,6 +140,10 @@ def scope_check(repo, base: str, head: str, card: dict, manifest: dict) -> Scope
     r.files_changed = len(files)
     paths = manifest.get("paths", {})
     protected = [*PROTECTED_BUILTIN, *paths.get("tests", []), *paths.get("protected", [])]
+    writable = card["scope"]["writable"]
+    if card.get("kind") == "characterization":  # inverted rule: tests writable, source protected
+        protected = [*PROTECTED_BUILTIN, *paths.get("src", []), *paths.get("protected", [])]
+        writable = paths.get("tests", [])
     deps_ok = bool(card.get("deps", {}).get("allowed_new"))
     acceptance = {t["path"] for t in card["acceptance"]["tests"]}
     required_for = manifest.get("owner_approval", {}).get("required_for", [])
@@ -151,7 +157,7 @@ def scope_check(repo, base: str, head: str, card: dict, manifest: dict) -> Scope
                 r.human_gate = True
         elif match(f, protected):
             r.protected_touched.append(f)
-        if not match(f, card["scope"]["writable"]):
+        if not match(f, writable):
             r.outside_writable.append(f)
         if match(f, [p for p in required_for if "/" in p or "*" in p or "." in p]):
             r.human_gate = True
@@ -238,6 +244,38 @@ def _run(name: str, cmd: dict, source: str, repo: pathlib.Path, run_dir: pathlib
                       hashlib.sha256(log.read_bytes()).hexdigest() if log.exists() else None)
 
 
+ARTIFACT_KINDS = {".png": "screenshot", ".zip": "trace", ".webm": "video"}
+
+
+def collect_artifacts(repo, run_dir, started_at: float, manifest: dict) -> list[dict]:
+    """Playwright files under test-results/ and every command `report` newer than `started_at`, copied to
+    <run_dir>/artifacts/<rel> and hashed. Regular files inside the repo only: symlinks are never followed."""
+    repo, real = pathlib.Path(repo), os.path.realpath(repo)
+    found = {repo / c["report"]: "junit" for c in manifest.get("commands", {}).values() if c and c.get("report")}
+    for top, dirs, names in os.walk(repo / "test-results"):  # followlinks=False
+        found.update({pathlib.Path(top, n): ARTIFACT_KINDS[pathlib.Path(n).suffix] for n in sorted(names)
+                      if pathlib.Path(n).suffix in ARTIFACT_KINDS})
+        dirs.sort()
+    out = []
+    for path, kind in found.items():
+        try:
+            st = os.lstat(path)
+        except OSError:
+            continue
+        if (not stat.S_ISREG(st.st_mode) or st.st_mtime < started_at
+                or not os.path.realpath(path).startswith(real + os.sep)):
+            continue
+        rel = path.relative_to(repo).as_posix()
+        dest = pathlib.Path(run_dir) / "artifacts" / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, dest, follow_symlinks=False)
+        row = {"kind": kind, "path": rel, "sha256": hashlib.sha256(dest.read_bytes()).hexdigest()}
+        if rel.startswith("test-results/") and rel.count("/") > 1:
+            row["journey"] = rel.split("/")[1]
+        out.append(row)
+    return out
+
+
 def _base_executed(repo: pathlib.Path, base: str, cmd: dict) -> int | None:
     """Tests executed by the base SHA's own test command, in a throwaway detached worktree."""
     wt = pathlib.Path(tempfile.mkdtemp(prefix="factory-gate-base-")) / "wt"
@@ -253,7 +291,7 @@ def run_gate(repo, card_id: str, c0: str, attempt: int = 1, ci: bool = False,
     """Plan v3 §3.1 step 8: restore acceptance from C0 → secrets → scope → base-SHA manifest
     commands → card success command → boot/e2e; write evidence.json; in --ci post 3 statuses."""
     repo = pathlib.Path(repo).resolve()
-    started = _now()
+    started, t0 = _now(), time.time()
     head = git(repo, "rev-parse", "HEAD").strip()
     base = git(repo, "rev-parse", f"{c0}^").strip()
     card, card_sha = load_card(repo, c0, card_id)
@@ -278,6 +316,7 @@ def run_gate(repo, card_id: str, c0: str, attempt: int = 1, ci: bool = False,
     for name, cmd, source in plan:
         gates.append(_run(name, cmd, source, repo, run_dir) if cmd
                      else GateResult(name, "absent", source))
+    artifacts = collect_artifacts(repo, run_dir, t0, manifest)
 
     reasons = [*scope.reasons] + (["secrets"] if gates[0].status != "pass" else [])
     required = {g["name"]: g["required"] for g in manifest.get("gates", [])}
@@ -305,7 +344,7 @@ def run_gate(repo, card_id: str, c0: str, attempt: int = 1, ci: bool = False,
                        "finished_at": _now()},
            "runner": {"factory_version": version, "host": "gha" if ci else "mac-local",
                       "manifest_sha256": hashlib.sha256(raw).hexdigest()},
-           "gates": [g.to_json() for g in gates], "scope": scope.to_json(), "artifacts": [],
+           "gates": [g.to_json() for g in gates], "scope": scope.to_json(), "artifacts": artifacts,
            "judge": None, "result": result}
     schemas.validate("evidence", doc)
     path = run_dir / "evidence.json"
@@ -357,7 +396,7 @@ def push(ev: Evidence, repo) -> str:
     summary.write_text("\n".join([
         f"### factory gate: `{d['result']}`", "", f"evidence sha256: `{ev.sha256}`",
         (f"head `{d['repo']['head_sha']}` · base `{d['repo']['base_sha']}` · "
-         f"C0 `{d['card']['c0_sha']}`"), "", "| gate | status | exit | tests |", "|---|---|---|---|",
+         f"C0 `{d['card']['c0_sha']}`"), f"artifacts: {len(d['artifacts'])}", "", "| gate | status | exit | tests |", "|---|---|---|---|",
         *rows, *([""] + [f"flagged: {f}" for f in ev.flagged] if ev.flagged else [])]) + "\n")
     body.write_text(f"Card `{d['card']['id']}` frozen at C0 `{d['card']['c0_sha']}`.\n\n"
                     f"{ev.card['title']}\n\nGate evidence is in the first comment.\n")
