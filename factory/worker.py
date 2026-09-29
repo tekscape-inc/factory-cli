@@ -8,24 +8,34 @@ import fcntl
 import json
 import os
 import pathlib
+import re
 import shlex
 import subprocess
 
 from factory import orca
 
+QWEN_OPTS = {"QWEN_THINKING": "true|false", "QWEN_WALL_S": "[0-9]+",  # + 30 <= QWEN_WALL_S <= 2700
+             "QWEN_GATE_URL": r"http://127\.0\.0\.1:[0-9]{1,5}"}  # P3 §I-A7: loopback gate only
 ALLOWED = {"PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL", "TERM",
-           "COLORTERM"}
+           "COLORTERM", *QWEN_OPTS}
 AGENTS = {"claude": "claude --dangerously-skip-permissions",
           "codex": "codex --dangerously-bypass-approvals-and-sandbox",
-          # Qwen lane: wrappers mint a qwen-gate session token themselves (P2-T7); ALLOWED is unchanged
+          # Qwen lane: wrappers mint a qwen-gate session token themselves (P2-T7); key never in env
           "opencode": os.path.expanduser("~/.factory/bin/qwen-opencode"),
           "aider": os.path.expanduser("~/.factory/bin/qwen-aider")}
 CLAUDE_JSON, CODEX_TOML = "~/.claude.json", "~/.codex/config.toml"
 
 
+class WorkerError(ValueError):
+    """An allowlisted QWEN_* value is out of bounds; nothing is launched."""
+
+
 def build_env(business: str, lane: str, card: str, c0: str) -> dict[str, str]:
     """Start from {}; copy only ALLOWED + FACTORY_*; per-business dirs when business != tekscape."""
     env = {k: v for k, v in os.environ.items() if k in ALLOWED}
+    for k in sorted(QWEN_OPTS.keys() & env.keys()):
+        if not re.fullmatch(QWEN_OPTS[k], env[k]) or (k == "QWEN_WALL_S" and not 30 <= int(env[k]) <= 2700):
+            raise WorkerError(f"{k}={env[k]!r} refused: must match {QWEN_OPTS[k]} (QWEN_WALL_S 30-2700)")
     venv = os.environ.get("VIRTUAL_ENV")
     if venv and "PATH" in env:  # `uv run factory` prepends its venv; the worker must not see it
         env["PATH"] = os.pathsep.join(p for p in env["PATH"].split(":") if p != f"{venv}/bin")
@@ -60,7 +70,7 @@ def _codex_block(path: str) -> str:
     return f'\n[projects."{path}"]\ntrust_level = "trusted"\n'
 
 
-def _edit(worktree: str, add: bool, claude_json=None, codex_toml=None) -> str:
+def trust(worktree: str, claude_json=None, codex_toml=None, add: bool = True) -> str:
     path = os.path.realpath(worktree)
     cj = pathlib.Path(claude_json or CLAUDE_JSON).expanduser()
     ct = pathlib.Path(codex_toml or CODEX_TOML).expanduser()
@@ -81,12 +91,8 @@ def _edit(worktree: str, add: bool, claude_json=None, codex_toml=None) -> str:
     return path
 
 
-def trust(worktree: str, claude_json=None, codex_toml=None) -> str:
-    return _edit(worktree, True, claude_json, codex_toml)
-
-
 def untrust(worktree: str, claude_json=None, codex_toml=None) -> str:
-    return _edit(worktree, False, claude_json, codex_toml)
+    return trust(worktree, claude_json, codex_toml, add=False)
 
 
 def start(repo: str, card: str, agent: str, prompt: str, business: str = "tekscape",
@@ -94,11 +100,11 @@ def start(repo: str, card: str, agent: str, prompt: str, business: str = "teksca
     repo = os.path.realpath(os.path.expanduser(repo))
     c0 = c0 or subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"], capture_output=True,
                               text=True, check=True).stdout.strip()
+    env = build_env(business, lane, card, c0)  # WorkerError here: no worktree, no terminal
     wt = orca.orca("worktree", "create", repo=f"path:{repo}", name=card, setup="skip",
                    no_parent=True, base_branch=c0)["worktree"]["path"]  # the worker starts at C0
     try:
         trust(wt)
-        env = build_env(business, lane, card, c0)
         cmd = shlex.join(["env", "-i", *(f"{k}={v}" for k, v in sorted(env.items()))])
         cmd += f" {AGENTS[agent]} {shlex.quote(prompt)}"
         term = orca.orca("terminal", "create", worktree=f"path:{wt}", title=card, command=cmd)

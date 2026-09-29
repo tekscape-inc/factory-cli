@@ -57,5 +57,10 @@ Reply with **ONE JSON object and nothing else** (no prose, no code fence), exact
  "findings": [{"severity": "low|medium|high", "text": "<one sentence>", "file": "<path>", "line": 1}]}
 ```
 
+**Artifacts** (§I-A5): when `# Artifacts` lists files, they are staged read-only under `.factory/artifacts/<path>`.
+Open each and add `"artifacts_observed": [{"path": "<path as listed>", "observation": "<value>"}]` to your object:
+junit → the `timestamp` attribute of the first `<testsuite>`; png → `<w>x<h>` from the IHDR chunk; zip (trace) →
+the number of entries; `unreadable` if it cannot be opened. The harness re-derives each value; a PASS with none
+matching becomes `HUMAN`; when a junit or trace is listed, one of those must match (a png size alone does not count). Never copy a value from the prompt: none of these values appear in it.
 Include **every** criterion id from the card. `findings` may be empty. `file`/`line` are optional.
 A verdict with a different `sha`, a missing criterion, or `PASS` with a `high` finding is rejected as `BLOCK`.

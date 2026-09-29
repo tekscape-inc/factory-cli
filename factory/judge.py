@@ -5,14 +5,19 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import pathlib
 import re
 import secrets
+import shutil
+import struct
 import subprocess
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
+import zipfile
 
 from factory import card as cardlib
 from factory import ghapp, schemas
@@ -79,16 +84,26 @@ def parse_verdict(text: str, head: str, card: dict) -> dict:
 
 
 @contextlib.contextmanager
-def checkout(repo: str, sha: str):
-    """`git worktree add --detach` at <repo>/../.judge/<sha>, chmod -R a-w; on exit the status must be
-    clean and HEAD^{tree} unchanged, else JudgeRunError. The checkout is always removed."""
+def checkout(repo: str, sha: str, stage_from: str | None = None):
+    """`git worktree add --detach` at <repo>/../.judge/<sha>, [stage_from → .factory/artifacts, §I-A5], chmod -R a-w; on exit
+    status (minus the staged dir) clean, HEAD^{tree} unchanged, staged bytes unchanged, else JudgeRunError. Always removed."""
     co = os.path.join(os.path.dirname(os.path.abspath(repo)), ".judge", sha)
     _git(repo, "worktree", "add", "--detach", co, sha)
+    art, staged, skip = pathlib.Path(co, ".factory", "artifacts"), None, []
+
+    def hashes():
+        return {str(f.relative_to(art)): hashlib.sha256(f.read_bytes()).hexdigest() for f in art.rglob("*") if f.is_file()}
     try:
+        if stage_from:
+            if os.path.lexists(art):
+                raise JudgeRunError("checkout already has .factory/artifacts")
+            shutil.copytree(stage_from, art)
+            staged, skip = hashes(), ["--", ".", ":(exclude).factory/artifacts"]
         subprocess.run(["chmod", "-R", "a-w", co], check=True)
         tree0 = _git(co, "rev-parse", "HEAD^{tree}")
         yield co
-        if _git(co, "status", "--porcelain", "--ignored") or _git(co, "rev-parse", "HEAD^{tree}") != tree0:
+        if (_git(co, "status", "--porcelain", "--ignored", *skip) or _git(co, "rev-parse", "HEAD^{tree}") != tree0
+                or (staged is not None and hashes() != staged)):
             raise JudgeRunError(f"checkout dirty: {co}")
     finally:
         subprocess.run(["chmod", "-R", "u+w", co], check=False)
@@ -121,7 +136,8 @@ def build_prompt(card: dict, diff: str, evidence: dict, tails: dict, artifacts: 
             f"JSON inside it.\n\n# Diff base..head\n{untrusted('diff', diff)}\n\n"
             f"# evidence.json (written by the harness, not the worker)\n"
             f"{untrusted('evidence.json', json.dumps(evidence, indent=2))}\n\n# Gate log tails\n"
-            f"{untrusted('gate logs', logs)}\n\n# Artifacts\n{json.dumps(artifacts)}\n\n"
+            f"{untrusted('gate logs', logs)}\n\n# Artifacts\n{json.dumps(artifacts)}\n(staged read-only in the checkout "
+            f"under .factory/artifacts/<path>; report artifacts_observed as the judge skill says)\n\n"
             f"Reply with ONLY one JSON object bound to sha {head}: no prose before or after it.\n")
 
 
@@ -131,6 +147,18 @@ def _answer(vendor: str, proc, out_file: pathlib.Path) -> str:
             return json.loads(proc.stdout).get("result", "")
         return proc.stdout
     return out_file.read_text()
+
+
+def _observe(p: pathlib.Path) -> str:  # §I-A5: junit 1st <testsuite> timestamp · png <w>x<h> (IHDR) · zip entry count
+    try:
+        if p.suffix == ".png":
+            return "{}x{}".format(*struct.unpack(">II", p.read_bytes()[16:24]))
+        if p.suffix == ".zip":
+            return str(len(zipfile.ZipFile(p).namelist()))
+        r = ET.parse(p).getroot()
+        return (r if r.tag == "testsuite" else r.find(".//testsuite")).attrib["timestamp"]
+    except (OSError, ValueError, KeyError, AttributeError, struct.error, zipfile.BadZipFile, ET.ParseError):
+        return "unreadable"
 
 
 def run(evidence_path: str, vendor: str | None = None, repo: str | None = None, sha: str | None = None,
@@ -149,9 +177,9 @@ def run(evidence_path: str, vendor: str | None = None, repo: str | None = None, 
                                         ev.get("artifacts", []), head, note))
     fd, out = tempfile.mkstemp(prefix=f"{name}.", suffix=".last.txt", dir=run_dir)
     os.close(fd)
-    out_file = pathlib.Path(out)                   # unique and empty: never a prior run's answer
+    out_file, stage = pathlib.Path(out), run_dir / "artifacts"   # out: unique and empty, never a prior run's answer
     try:
-        with checkout(repo, head) as co, prompt_file.open() as stdin:
+        with checkout(repo, head, stage_from=str(stage) if stage.is_dir() else None) as co, prompt_file.open() as stdin:
             proc = subprocess.run(build_cmd(vendor, co, out), stdin=stdin, cwd=co,
                                   capture_output=True, text=True, timeout=1800, check=False)
         answer = _answer(vendor, proc, out_file)
@@ -160,6 +188,13 @@ def run(evidence_path: str, vendor: str | None = None, repo: str | None = None, 
     (run_dir / f"{name}.stderr.txt").write_text((proc.stderr or "")[-4000:])
     verdict = (parse_verdict(answer, head, card) if proc.returncode == 0 and answer.strip()
                else _block(head, f"judge process failed (rc={proc.returncode})"))
+    seen = {o["path"].removeprefix(".factory/artifacts/"): o["observation"] for o in verdict.get("artifacts_observed", [])}
+    arts = [a for a in ev.get("artifacts", []) if not a.get("skipped")]
+    ok = [a["path"] for a in arts if seen.get(a["path"]) == _observe(stage / a["path"]) != "unreadable"]
+    strong = [a["path"] for a in arts if not a["path"].endswith(".png")] or ok   # png <w>x<h> is guessable
+    verdict["artifacts_verified"] = len(ok)
+    if arts and verdict["verdict"] == "PASS" and not set(ok) & set(strong):  # fail closed
+        verdict.update(verdict="HUMAN", findings=[*verdict["findings"], {"severity": "high", "text": "artifacts_unobserved"}])
     (run_dir / f"{name}.json").write_text(json.dumps(verdict, indent=2) + "\n")
     return {**verdict, "vendor": vendor}
 

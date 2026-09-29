@@ -21,12 +21,11 @@ import subprocess
 import sys
 import tempfile
 import time
-import xml.etree.ElementTree as ET
 
 import yaml
 
 from factory import schemas
-from factory.doctor import run_command
+from factory.doctor import junit_counts, run_command
 
 PROTECTED_BUILTIN = (
     ".factory/**", "factory.yaml", ".github/**", "CODEOWNERS", ".github/CODEOWNERS",
@@ -97,7 +96,7 @@ class ScopeResult:
     result: str = "pass"  # pass | fail | tamper
     reasons: list = dataclasses.field(default_factory=list)
     flagged: list = dataclasses.field(default_factory=list)
-    human_gate: bool = False
+    human_gate_reasons: list = dataclasses.field(default_factory=list)
     files_changed: int = 0
     lines_added: int = 0
     lines_deleted: int = 0
@@ -114,8 +113,8 @@ class ScopeResult:
             self.result = "tamper" if tamper else "fail"
 
     def to_json(self) -> dict:
-        skip = ("result", "reasons", "flagged", "human_gate")
-        return {k: v for k, v in dataclasses.asdict(self).items() if k not in skip}
+        return {k: v for k, v in dataclasses.asdict(self).items()
+                if k not in ("result", "reasons", "flagged")}
 
 
 def _added_lines(repo, base: str, head: str) -> list[tuple[str, str]]:
@@ -154,13 +153,13 @@ def scope_check(repo, base: str, head: str, card: dict, manifest: dict) -> Scope
             if not deps_ok:
                 r.protected_touched.append(f)
             elif "new_dependency" in required_for:
-                r.human_gate = True
+                r.human_gate_reasons.append("new_dependency")
         elif match(f, protected):
             r.protected_touched.append(f)
         if not match(f, writable):
             r.outside_writable.append(f)
-        if match(f, [p for p in required_for if "/" in p or "*" in p or "." in p]):
-            r.human_gate = True
+        for p in [p for p in required_for if "/" in p or "*" in p or "." in p]:
+            r.human_gate_reasons += [p] if match(f, [p]) and p not in r.human_gate_reasons else []
     if r.acceptance_modified_by_worker:
         r.fail("acceptance_modified", tamper=True)
     if r.protected_touched:
@@ -224,27 +223,20 @@ def _now() -> str:
     return datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _junit(report: pathlib.Path) -> dict:
-    root = ET.parse(report).getroot()
-    suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
-    n = {k: sum(int(s.get(k, 0)) for s in suites) for k in ("tests", "failures", "errors", "skipped")}
-    return {"executed": n["tests"] - n["skipped"], "failed": n["failures"] + n["errors"],
-            "skipped": n["skipped"]}
-
-
 def _run(name: str, cmd: dict, source: str, repo: pathlib.Path, run_dir: pathlib.Path) -> GateResult:
     """doctor.run_command (timeout, env, report + min_tests) with output teed to <run_dir>/<name>.log."""
     log = run_dir / f"{name}.log"
     wrapped = {**cmd, "run": f"( {cmd['run']}\n) > {shlex.quote(str(log))} 2>&1"}
     r = run_command(name, wrapped, repo)
     report = repo / cmd["report"] if cmd.get("report") else None
-    tests = _junit(report) if report and report.exists() else None
+    tests = junit_counts(report) if report and report.exists() else None
     return GateResult(name, r["status"], source, cmd["run"], r["exit"], tests,
                       int(r["duration_s"] * 1000), str(log),
                       hashlib.sha256(log.read_bytes()).hexdigest() if log.exists() else None)
 
 
 ARTIFACT_KINDS = {".png": "screenshot", ".zip": "trace", ".webm": "video"}
+ARTIFACT_MAX_BYTES = 50 * 1024 * 1024  # larger files are listed (size, skipped) but not copied
 
 
 def collect_artifacts(repo, run_dir, started_at: float, manifest: dict) -> list[dict]:
@@ -258,18 +250,26 @@ def collect_artifacts(repo, run_dir, started_at: float, manifest: dict) -> list[
         dirs.sort()
     out = []
     for path, kind in found.items():
-        try:
-            st = os.lstat(path)
+        if not os.path.realpath(path).startswith(real + os.sep):
+            continue
+        try:  # open without following links, then check/copy from the fd: no lstat→copy swap window
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
         except OSError:
             continue
-        if (not stat.S_ISREG(st.st_mode) or st.st_mtime < started_at
-                or not os.path.realpath(path).startswith(real + os.sep)):
-            continue
-        rel = path.relative_to(repo).as_posix()
-        dest = pathlib.Path(run_dir) / "artifacts" / rel
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(path, dest, follow_symlinks=False)
-        row = {"kind": kind, "path": rel, "sha256": hashlib.sha256(dest.read_bytes()).hexdigest()}
+        with os.fdopen(fd, "rb") as src:
+            st = os.fstat(src.fileno())
+            if not stat.S_ISREG(st.st_mode) or st.st_mtime < started_at:
+                continue
+            rel = path.relative_to(repo).as_posix()
+            row = {"kind": kind, "path": rel}
+            if st.st_size > ARTIFACT_MAX_BYTES:
+                row.update(size=st.st_size, skipped="oversize")
+            else:
+                data = src.read()
+                dest = pathlib.Path(run_dir) / "artifacts" / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(data)
+                row["sha256"] = hashlib.sha256(data).hexdigest()
         if rel.startswith("test-results/") and rel.count("/") > 1:
             row["journey"] = rel.split("/")[1]
         out.append(row)
@@ -306,6 +306,7 @@ def run_gate(repo, card_id: str, c0: str, attempt: int = 1, ci: bool = False,
     gates = [secrets_check(repo, base, head)]
     scope = scope_check(repo, c0, head, card, manifest)
     scope.acceptance_restored = bool(restored)
+    scope.human_gate_reasons += ["risk_high"] if card["risk_class"] == "high" else []
     if ci and git(repo, "diff", "--name-only", base, head, "--", ".github").strip():
         scope.fail("workflow_changed_vs_base", tamper=True)  # Review focus 1
     gates.append(GateResult("scope", "pass" if scope.result == "pass" else "fail"))
@@ -349,7 +350,7 @@ def run_gate(repo, card_id: str, c0: str, attempt: int = 1, ci: bool = False,
     schemas.validate("evidence", doc)
     path = run_dir / "evidence.json"
     path.write_text(json.dumps(doc, indent=2) + "\n")
-    ev = Evidence(doc, reasons, scope.flagged, card["risk_class"] == "high" or scope.human_gate,
+    ev = Evidence(doc, reasons, scope.flagged, bool(scope.human_gate_reasons),
                   path, hashlib.sha256(path.read_bytes()).hexdigest(), card,
                   manifest["repo"].get("base_branch", "main"))
     if ci:
@@ -371,20 +372,9 @@ def post_ci_statuses(ev: Evidence, repo) -> None:
                "-f", f"description=result={ev.doc['result']} evidence {ev.sha256[:12]}"], cwd=repo)
 
 
-def _judge_required(ev: Evidence, repo) -> bool:
-    """True iff the base branch's active rules require factory/judge PINNED to the judge App (integration_id
-    from ~/.factory/app.json). An unpinned requirement could be satisfied by any token, so it does not count."""
-    path = f"repos/{ev.doc['repo']['github']}/rules/branches/{ev.base_branch}"
-    rules = json.loads(_call(["gh", "api", path], cwd=repo) or "[]")
-    app = json.loads((pathlib.Path(os.environ.get("FACTORY_HOME", pathlib.Path.home() / ".factory")) / "app.json").read_text())
-    return any(c.get("context") == "factory/judge" and c.get("integration_id") == app["app_id"] for r in rules
-               if r.get("type") == "required_status_checks"
-               for c in r.get("parameters", {}).get("required_status_checks", []))
-
-
 def push(ev: Evidence, repo) -> str:
     """Push the gated head SHA to factory/<card>, open the PR, post ONE evidence comment, then
-    `gh pr merge --auto --squash` unless HUMAN_GATE. Merging itself stays with GitHub + ruleset."""
+    print `HUMAN_GATE <url> reason=<csv>` or `GATED <url>`. Arming is scripts/lib/arm.sh only (§I-A2)."""
     d = ev.doc
     if d["result"] != "pass":
         raise GateError(f"refusing to push: result={d['result']} {ev.reasons}")
@@ -403,13 +393,8 @@ def push(ev: Evidence, repo) -> str:
     url = _call(["gh", "pr", "create", "--base", ev.base_branch, "--head", branch, "--title",
                  f"{d['card']['id']}: {ev.card['title']}", "--body-file", str(body)], cwd=repo)
     _call(["gh", "pr", "comment", url, "--body-file", str(summary)], cwd=repo)
-    if ev.human_gate:
-        print(f"HUMAN_GATE {url}")
-    elif not _judge_required(ev, repo):  # gh merges a CLEAN PR at once: --auto would skip the judge
-        print(f"NO_RULESET {url}")
-    else:
-        _call(["gh", "pr", "merge", "--auto", "--squash", "--match-head-commit",
-               d["repo"]["head_sha"], url], cwd=repo)
+    reasons = ",".join(d["scope"]["human_gate_reasons"])
+    print(f"HUMAN_GATE {url} reason={reasons}" if ev.human_gate else f"GATED {url}")
     print(url)
     return url
 
@@ -422,7 +407,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--repo", default=".")
     ap.add_argument("--runs-root")
     ap.add_argument("--ci", action="store_true", help="post factory/{secrets,scope,gates}")
-    ap.add_argument("--push", action="store_true", help="on pass: push, PR, evidence comment, --auto")
+    ap.add_argument("--push", action="store_true", help="on pass: push, PR, evidence comment (never arms)")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
     try:

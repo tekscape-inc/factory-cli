@@ -11,11 +11,10 @@ import urllib.request
 
 import jwt
 
-from factory.orca import FACTORY_HOME
+from factory.orca import FACTORY_HOME, LEDGER
 
 API = "https://api.github.com"
 APP_JSON = FACTORY_HOME / "app.json"
-LEDGER = FACTORY_HOME / "ledger.jsonl"
 KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT = "factory.judge-app.pem", "factory"
 _CACHE: dict = {}
 

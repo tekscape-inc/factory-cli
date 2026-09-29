@@ -64,17 +64,27 @@ def freeze(repo: str, card_id: str, base: str = "origin/main", push: bool = True
             "card_sha256": digest, "status": "success"}
 
 
-def restamp(repo: str, card_id: str, c0: str) -> int | None:  # C0' is stamped only if its bytes match
-    rel = f".factory/cards/{card_id}.json"
-    digest = json.loads(pathlib.Path(repo, rel).read_text()).get("frozen", {}).get("card_sha256")
-    raw = subprocess.run(["git", "-C", repo, "show", f"{c0}:{rel}"], capture_output=True, check=False).stdout
-    if hashlib.sha256(raw).hexdigest() != digest:
-        return print(f"{card_id}: card at {c0} != frozen sha256; not restamped", file=sys.stderr) or 2
-    for t in json.loads(raw)["acceptance"]["tests"]:  # frozen acceptance bytes must survive the rebase too
-        blob = subprocess.run(["git", "-C", repo, "show", f"{c0}:{t['path']}"], capture_output=True, check=False).stdout
-        if hashlib.sha256(blob).hexdigest() != t["sha256"]:
-            return print(f"{card_id}: {t['path']} at {c0} != card sha256; not restamped", file=sys.stderr) or 2
-    ghapp.post_status(json.loads(raw)["repo"], c0, "factory/card", "success", f"{card_id} restamped {digest[:12]}")
+def _statuses(repo: str, sha: str) -> list:
+    return json.loads(subprocess.run(["gh", "api", f"repos/{repo}/commits/{sha}/statuses"], capture_output=True, check=False).stdout or b"[]")
+
+
+def restamp(repo: str, card_id: str, c0: str, src: str) -> int | None:
+    """Post factory/card on C0' only if C0 (`src`: the anchor, never a worktree file — F7) has the App's factory/card=success
+    + its ledger row, and C0' holds C0's exact card and acceptance bytes and nothing else (§I-A3)."""
+    rel, bot = f".factory/cards/{card_id}.json", json.loads(ghapp.APP_JSON.read_text())["slug"] + "[bot]"
+    show = lambda sha, p: subprocess.run(["git", "-C", repo, "show", f"{sha}:{p}"], capture_output=True, check=False)
+    doc = json.loads(show(src, rel).stdout)
+    paths, rows = [rel, *(t["path"] for t in doc["acceptance"]["tests"])], map(json.loads, filter(str.strip, ghapp.LEDGER.read_text().splitlines()))
+    why = [f"C0 {src} has no factory/card=success by {bot}"] * (not any((s["context"], s["state"], (s.get("creator") or {}).get(
+        "login")) == ("factory/card", "success", bot) for s in _statuses(doc["repo"], src)))
+    why += [f"no factory/card ledger row for C0 {src}"] * (not any((r.get("kind"), r.get("context"), r.get("sha")) == (
+        "status_post", "factory/card", src) for r in rows))
+    why += [f"{p} at {c0} differs from C0" for p in paths if (x := show(c0, p)).returncode or x.stdout != show(src, p).stdout]
+    why += [f"{p} changed in {c0} is not the card or an acceptance file" for p in
+            _git(repo, "diff", "--name-only", f"{c0}^", c0).split() if p not in paths]
+    if why:
+        return print(f"{card_id}: not restamped: {'; '.join(why)}", file=sys.stderr) or 2
+    ghapp.post_status(doc["repo"], c0, "factory/card", "success", f"{card_id} restamped {card_sha256(doc)[:12]} from {src[:12]}")
 
 
 def main(argv: list[str]) -> int:
@@ -82,7 +92,8 @@ def main(argv: list[str]) -> int:
     mode = p.add_mutually_exclusive_group(required=True)
     mode.add_argument("--freeze", action="store_true")
     mode.add_argument("--validate", metavar="CARD_JSON", help="schema-check a card file; exit 0/1")
-    mode.add_argument("--restamp", metavar="C0_SHA", help="restamp a rebased C0")
+    mode.add_argument("--restamp", metavar="C0_SHA", help="restamp a rebased C0 (C0'); needs --from <C0>")
+    p.add_argument("--from", dest="src", metavar="C0_SHA", help="the App-stamped C0 that C0' was rebased from")
     p.add_argument("--repo")
     p.add_argument("--card")
     p.add_argument("--base", default="origin/main")
@@ -99,7 +110,7 @@ def main(argv: list[str]) -> int:
     if not (a.repo and a.card):
         p.error("--freeze needs --repo and --card")
     if a.restamp:
-        return restamp(os.path.expanduser(a.repo), a.card, a.restamp) or 0
+        return restamp(os.path.expanduser(a.repo), a.card, a.restamp, a.src) or 0 if a.src else p.error("--restamp needs --from")
     out = freeze(os.path.expanduser(a.repo), a.card, base=a.base)
     print(json.dumps(out) if a.json else f"{out['card']}: C0 {out['c0_sha']} on {out['branch']}")
     return 0

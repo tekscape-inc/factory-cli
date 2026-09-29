@@ -38,7 +38,7 @@ def _origin_slug(path: pathlib.Path) -> str:
 def infer(path) -> dict:
     """`--init`: stack from pyproject.toml / package.json / go.mod. Anything unproven is null."""
     path = pathlib.Path(path)
-    cmds = dict.fromkeys(("setup", "build", "lint", "typecheck", "test", "e2e", "boot"))
+    cmds = dict.fromkeys(ORDER)  # same keys and order as the manifest schema
     langs = []
     if (path / "pyproject.toml").exists():
         langs.append("python")
@@ -71,10 +71,13 @@ def validate_manifest(m: dict) -> None:
                           f"(got {m['risk_class']!r})")
 
 
-def _junit_executed(report: pathlib.Path) -> int:
+def junit_counts(report: pathlib.Path) -> dict:
+    """executed (= tests − skipped), failed (= failures + errors) and skipped over every testsuite."""
     root = ET.parse(report).getroot()
-    suites = [root] if root.tag == "testsuite" else root.iter("testsuite")
-    return sum(int(s.get("tests", 0)) - int(s.get("skipped", 0)) for s in suites)
+    suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+    n = {k: sum(int(s.get(k, 0)) for s in suites) for k in ("tests", "failures", "errors", "skipped")}
+    return {"executed": n["tests"] - n["skipped"], "failed": n["failures"] + n["errors"],
+            "skipped": n["skipped"]}
 
 
 def run_command(name: str, cmd: dict, cwd) -> dict:
@@ -98,7 +101,7 @@ def run_command(name: str, cmd: dict, cwd) -> dict:
     elif report:
         if not report.exists():
             return {**r, "status": "fail", "reason": f"report {cmd['report']} not written"}
-        r["executed"] = n = _junit_executed(report)
+        r["executed"] = n = junit_counts(report)["executed"]
         if n < cmd.get("min_tests", 1):
             r.update(status="fail", reason=f"executed {n} < min_tests {cmd.get('min_tests', 1)}")
     return r
